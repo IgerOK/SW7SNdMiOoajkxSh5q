@@ -1,0 +1,615 @@
+/* SSIABZ.ino — Часть 1 из 4
+   CH552 + SSI Encoder + ABZ Emulator
+
+Плата            : CH552 Board
+Clock Source     : 24 MHz (internal), 5V
+USB Settings     : Default CDC
+Upload method    : USB
+
+ФАЙЛЫ В ПРОЕКТЕ:
+- USBconstant_my.c   - USB дескрипторы
+- USBconstant_my.h   - заголовок
+*/
+
+#include <Arduino.h>
+
+// =========================================================================
+// 1. НАСТРОЙКИ КОМПИЛЯЦИИ, МИКРОШАГ И НАПРАВЛЕНИЕ ПО УМОЛЧАНИЮ
+// =========================================================================
+#define SSI_CLK_INVERTED   1 // 1 - инверсный клок, 0 - прямой клок
+
+// Значение микрошага по умолчанию при старте системы (16, 32, 64 или 128)
+#define DEFAULT_MICROSTEP  64
+
+// Направление вращения по умолчанию при старте (0 — прямое, 1 — инверсное)
+#define DEFAULT_DIRECTION  0
+
+#define COORD_MAX          8388608ULL 
+#define HALF_COORD         4194304L
+
+// Автоматический предрасчет стартовых коэффициентов для setup()
+#if (DEFAULT_MICROSTEP == 16)
+    #define START_K_MIN    25L
+#elif (DEFAULT_MICROSTEP == 32)
+    #define START_K_MIN    50L
+#elif (DEFAULT_MICROSTEP == 64)
+    #define START_K_MIN    100L
+#elif (DEFAULT_MICROSTEP == 128)
+    #define START_K_MIN    200L
+#else
+    #error "Неверно задан DEFAULT_MICROSTEP! Выберите 16, 32, 64 или 128."
+#endif
+
+// Настройка частоты Таймера 2 (~80 кГц при F_sys = 24 МГц)
+#define T2_RELOAD_VAL      (65536 - 300) 
+
+// Динамические таймауты для пакетного режима парсера
+#define PORT_LOCK_TIMEOUT  1000   // Блокировка встречного порта на 1 секунду после активности
+#define PACKET_TIMEOUT_US  2000   // Межсимвольный таймаут пакета 2 мс (2000 мкс)
+
+// Константы режимов портов обмена
+#define MODE_NONE 0
+#define MODE_USB  1
+#define MODE_UART 2
+
+// =========================================================================
+// 2. ОПРЕДЕЛЕНИЕ ПИНОВ И РЕГИСТРОВ SFR CH552 (SDCC)
+// =========================================================================
+#define PIN_DATA_SSI   P1_1  // Вход данных SSI (P1.1)
+#define PIN_CLK_SSI    P1_4  // Выход тактирования SSI (P1.4)
+
+#define PIN_HOME_LED   P1_5  // Светодиод "Дом / Индекс Z" (P1.5, активный 0)
+#define PIN_ACT_LED    P1_6  // Светодиод "Активность / Ошибка" (P1.6, active 0)
+#define PIN_PWR_LED    P1_7  // Светодиод "Питание / Статус" (P1.7, active 0)
+
+#define PIN_A_DRV      P3_2  // Выход канала А для AMAX-3245 (P3.2)
+#define PIN_B_DRV      P3_3  // Выход канала B для AMAX-3245 (P3.3)
+#define PIN_Z_DRV      P3_4  // Выход канала Z для AMAX-3245 (P3.4)
+
+// Макросы управления светодиодами (Активный 0)
+#define LED_PWR_ON()   (PIN_PWR_LED = 0)
+#define LED_PWR_OFF()  (PIN_PWR_LED = 1)
+#define LED_ACT_ON()   (PIN_ACT_LED = 0)
+#define LED_ACT_OFF()  (PIN_ACT_LED = 1)
+#define LED_HOME_ON()  (PIN_HOME_LED = 0)
+#define LED_HOME_OFF() (PIN_HOME_LED = 1)
+
+// Физическое инвертирование линий дифференциального клока
+#if SSI_CLK_INVERTED
+    #define SSI_CLK_SET_HIGH()  (PIN_CLK_SSI = 0)
+    #define SSI_CLK_SET_LOW()   (PIN_CLK_SSI = 1)
+#else
+    #define SSI_CLK_SET_HIGH()  (PIN_CLK_SSI = 1)
+    #define SSI_CLK_SET_LOW()   (PIN_CLK_SSI = 0)
+#endif
+
+// Макросы удержания уровней клока на ~500 нс (12 NOP при 24 МГц)
+#define DELAY_CLK_LOW()   __asm__("nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n")
+#define DELAY_CLK_HIGH()  __asm__("nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n")
+
+// =========================================================================
+// 3. ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ СИСТЕМЫ
+// =========================================================================
+#define ENCODER_OK       0
+#define ERR_NOT_READY    1   
+
+__xdata uint8_t  encoderStatus = ENCODER_OK;
+__xdata uint32_t data_ssi = 0;         
+__xdata uint32_t currentPosition = 0;
+__xdata uint32_t prevSsiPos = 0;
+__xdata int32_t  accumulatedSteps = 0; 
+__xdata uint8_t  isFirstRun = 1;
+__xdata uint32_t homeOffset = 0;
+
+// Глобальные переменные динамического микрошага (инициализируются из дефайна)
+volatile __xdata uint8_t  current_microstep = DEFAULT_MICROSTEP;
+volatile __xdata uint16_t scale_K_mul = START_K_MIN;
+
+// Глобальная переменная направления вращения (инициализируются из дефайна)
+volatile __xdata uint8_t  current_direction = DEFAULT_DIRECTION;
+
+// Флаг аппаратной конфигурации USB хостом (для автономной защиты)
+volatile __xdata uint8_t usb_is_configured = 0;
+
+// Переменные неблокирующих таймеров времени
+__xdata uint32_t lastSampleTime = 0;
+__xdata uint32_t lastPwrLedTime = 0;
+__xdata uint16_t pwrLedOnDuration = 500;  
+__xdata uint16_t pwrLedOffDuration = 500; 
+const uint32_t sampleInterval = 200; // 200 мкс (5 кГц)
+
+// Переменные селектора портов обмена
+__xdata uint8_t  activePortMode = MODE_NONE;
+__xdata uint32_t lastPortActivityTime = 0;
+__xdata uint32_t lastCharTime = 0; 
+
+// Символьные буферы команд парсера (размер 8 байт под короткие пакеты)
+__xdata char usbBuffer[8];  
+__xdata char uartBuffer[8];
+__xdata uint8_t usbBufIdx = 0;
+__xdata uint8_t uartBufIdx = 0;
+
+// =========================================================================
+// 4. ПОДПРОГРАММЫ ИНИЦИАЛИЗАЦИИ ЖЕЛЕЗА И ПЕРИФЕРИИ
+// =========================================================================
+
+void initHardwarePorts() {
+    // Настройка направлений портов ввода-вывода (P1_DIR = 0xBA, P3_DIR = 0xBB)
+    *(volatile __data uint8_t*)0xBA &= ~(1 << 1); // P1.1 на вход (DATA_SSI)
+    *(volatile __data uint8_t*)0xBA |= (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7); // Выходы P1.4, P1.5, P1.6, P1.7
+    *(volatile __data uint8_t*)0xBB |= (1 << 2) | (1 << 3) | (1 << 4); // Выходы P3.2, P3.3, P3.4
+
+    // Переключение пинов в режим Push-Pull (P1_MOD_OC = 0x92, P3_MOD_OC = 0x96)
+    *(volatile __data uint8_t*)0x92 &= ~((1 << 1) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7));
+    *(volatile __data uint8_t*)0x96 &= ~((1 << 2) | (1 << 3) | (1 << 4));
+
+    // Исходные безопасные состояния выходов
+    SSI_CLK_SET_HIGH();  // До старта клок обязан быть в логической 1
+    
+    // Выключаем все светодиоды на старте (подаем физическую 1 на аноды)
+    LED_PWR_OFF();
+    LED_ACT_OFF();
+    LED_HOME_OFF();
+
+    // Сброс фаз инкрементального выхода
+    PIN_A_DRV = 0;
+    PIN_B_DRV = 0;
+    PIN_Z_DRV = 0;
+}
+
+void initTimer2AndUart0() {
+    // 1. Настройка аппаратного UART0 в Режим 1 (8-бит данных, вариативная скорость)
+    SM0 = 0; SM1 = 1; 
+    REN = 1; // Разрешаем аппаратный прием байт по RS-232
+    
+    // 2. Настройка Таймера 2: Автоперезапуск, тактирование напрямую от частоты F_sys
+    T2CON = 0;              
+    T2MOD |= 0x40; // Переключение bT2_CLK = 1 (режим тактирования без делителя /12)         
+    RCAP2H = (T2_RELOAD_VAL >> 8) & 0xFF;
+    RCAP2L = T2_RELOAD_VAL & 0xFF;
+    T2COUNT = T2_RELOAD_VAL;
+    
+    // Привязываем тактирование генератора Baudrate UART0 к Таймеру 2
+    // Взводим биты RCLK (прием) и TCLK (передача) в управляющем регистре T2CON
+    T2CON |= (1 << 5) | (1 << 4); 
+    
+    TF2 = 0;                
+    IE |= (1 << 5); // Аппаратно разрешаем прерывание Таймера 2 (ET2 = 1)
+    TR2 = 1;        // Физический запуск Таймера 2      
+}
+
+// =========================================================================
+// 5. ЖЕСТКИЙ РЕАЛТАЙМ: ЧТЕНИЕ SSI, МАТЕМАТИКА И ПРЕРЫВАНИЕ ТАЙМЕРА 2
+// =========================================================================
+
+// Сверхбыстрое развернутое чтение 24 тактов под ЛИР-ДАТ237Т (без __critical)
+uint32_t readSSI23_diagnostic() {
+    uint8_t b2 = 0, b1 = 0, b0 = 0;
+
+    // --- ПРОВЕРКА 1: Контроль Стоп-условия перед стартом ---
+    // Перед началом нового цикла DATA должна быть строго в HIGH (прошлый t3 завершен)
+    if (PIN_DATA_SSI == 0) {
+        encoderStatus = ERR_NOT_READY;
+        return 0; 
+    }
+
+    // Такт 1 (СТАРТОВЫЙ) - защелкивание физической позиции вала в датчике ЛИР
+    SSI_CLK_SET_LOW();  DELAY_CLK_LOW();
+    SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH();
+
+    // Блок сборки b2 (7 битов: D22 ... D16)
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b2 = (b2 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b2 = (b2 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b2 = (b2 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b2 = (b2 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b2 = (b2 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b2 = (b2 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b2 = (b2 << 1) | PIN_DATA_SSI;
+
+    // Блок сборки b1 (8 битов: D15 ... D8)
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b1 = (b1 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b1 = (b1 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b1 = (b1 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b1 = (b1 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b1 = (b1 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b1 = (b1 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b1 = (b1 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b1 = (b1 << 1) | PIN_DATA_SSI;
+
+    // Блок сборки b0 (8 битов: D7 ... D0)
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b0 = (b0 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b0 = (b0 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b0 = (b0 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b0 = (b0 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b0 = (b0 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b0 = (b0 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b0 = (b0 << 1) | PIN_DATA_SSI;
+    SSI_CLK_SET_LOW(); DELAY_CLK_LOW(); SSI_CLK_SET_HIGH(); DELAY_CLK_HIGH(); b0 = (b0 << 1) | PIN_DATA_SSI;
+
+    // --- ПРОВЕРКА 2: Аппаратный контроль Монофлопа t3 ---
+    // Клок остался в HIGH. Исправный энкодер ОБЯЗАН принудительно прижать DATA к нулю.
+    __asm__("nop\n nop\n nop\n nop\n");
+
+    if (PIN_DATA_SSI == 1) {
+        // Обрыв шлейфа: линия удержана в единице внешней подтяжкой платы
+        encoderStatus = ERR_NOT_READY;
+        return 0; 
+    }
+
+    encoderStatus = ENCODER_OK; 
+    return (((uint32_t)b2 << 16) | ((uint32_t)b1 << 8) | b0) & 0x7FFFFF; 
+}
+
+// Высокоэффективный fixed-point расчет накопления шагов
+void processEncoderData(uint32_t ssiPos) {
+    int32_t deltaSsi;
+    int32_t deltaSteps;
+    uint32_t logicalPos;
+    int32_t currentMotorStepPos;
+
+    if (isFirstRun) { 
+        prevSsiPos = ssiPos; 
+        homeOffset = ssiPos; 
+        isFirstRun = 0; 
+        return; 
+    }
+
+    deltaSsi = (int32_t)(ssiPos - prevSsiPos);
+
+    // Обработка перехода через физический ноль абсолютника (8388607 <-> 0)
+    if (deltaSsi > HALF_COORD) {
+        deltaSsi -= COORD_MAX;
+    } else if (deltaSsi < -HALF_COORD) {
+        deltaSsi += COORD_MAX;
+    }
+
+    prevSsiPos = ssiPos;
+
+    // Сверхбыстрая Fixed-Point математика с использованием динамической переменной scale_K_mul
+    deltaSteps = (deltaSsi * (int32_t)scale_K_mul) >> 16;
+
+    // --- НАПРАВЛЕНИЕ ВРАЩЕНИЯ ---
+    // Если активировано инверсное направление (current_direction == 1), меняем знак дельты шагов
+    if (current_direction == 1) {
+        deltaSteps = -deltaSteps;
+    }
+
+    if (deltaSteps != 0) {
+        __critical {
+            accumulatedSteps += deltaSteps; // Защищаем атомарную склейку буфера
+        }
+        LED_ACT_ON(); 
+    } else {
+        LED_ACT_OFF(); 
+    }
+
+    // Расчет текущей координаты относительно установленного произвольного Хоума
+    logicalPos = ssiPos - homeOffset;
+    if (logicalPos > COORD_MAX) {
+        logicalPos += COORD_MAX; 
+    }
+
+    // Выдача индекса Z на плату AMAX-3245 ровно один раз на логический оборот сектора
+    currentMotorStepPos = (int32_t)((logicalPos * (uint32_t)scale_K_mul) >> 16);
+    if (currentMotorStepPos == 0) {
+        LED_HOME_ON();
+        PIN_Z_DRV = 1; 
+    } else {
+        LED_HOME_OFF();
+        PIN_Z_DRV = 0;
+    }
+}
+
+// Прерывание Таймера 2: Автомат генерации меандра Грея вперед и назад
+void Timer2_ISR(void) __interrupt(5) {
+    static uint8_t encPhase = 0;
+    T2CON &= ~(0xC0); // Очищаем флаги прерываний Таймера 2
+
+    if (accumulatedSteps == 0) {
+        return; // Вал замер, импульсы не требуются
+    }
+
+    if (accumulatedSteps > 0) {
+        encPhase = (encPhase + 1) & 0x03; 
+        accumulatedSteps--;               
+    } else {
+        encPhase = (encPhase - 1) & 0x03; 
+        accumulatedSteps++;               
+    }
+
+    // Переключение физических фаз для ЧПУ-стойки
+    switch (encPhase) {
+        case 0: PIN_A_DRV = 0; PIN_B_DRV = 0; break;
+        case 1: PIN_A_DRV = 1; PIN_B_DRV = 0; break;
+        case 2: PIN_A_DRV = 1; PIN_B_DRV = 1; break;
+        case 3: PIN_A_DRV = 0; PIN_B_DRV = 1; break;
+    }
+}
+
+// =========================================================================
+// 6. ФУНКЦИИ ОТПРАВКИ ОТВЕТОВ И ПАКЕТНЫЙ ПАРСЕР КОМАНД
+// =========================================================================
+
+// Отправка строки в выбранный активный порт (Си-стиль без putchar)
+void sendResponseStr(const char *msg, uint8_t portSource) {
+    if (portSource == MODE_USB) {
+        while (*msg) {
+            USBSerial_write(*msg++); // Родной посимвольный вывод ch55xduino в виртуальный USB-COM
+        }
+    } else {
+        while (*msg) {
+            SBUF = *msg++; while (!TI); TI = 0; // Прямо в аппаратный UART0 (RS-232)
+        }
+    }
+}
+
+// Вспомогательная функция для перевода 32-битного числа в ASCII-строку
+void sendResponseUInt(uint32_t val, uint8_t portSource) {
+    char buf[12]; // Локальный массив под разбор числа
+    uint8_t i = 0;
+    if (val == 0) { 
+        sendResponseStr("0", portSource); 
+        return; 
+    }
+    while (val > 0) { 
+        buf[i++] = (val % 10) + '0'; 
+        val /= 10; 
+    }
+    while (i > 0) {
+        char c = buf[--i];
+        if (portSource == MODE_USB) USBSerial_write(c);
+        else { SBUF = c; while (!TI); TI = 0; }
+    }
+}
+
+// Вспомогательная функция для перевода знакового числа в ASCII-строку
+void sendResponseInt(int32_t r_data, uint8_t portSource) { 
+    if (r_data < 0) { 
+        sendResponseStr("-", portSource); 
+        r_data = -r_data; 
+    }
+    sendResponseUInt((uint32_t)r_data, portSource);
+}
+
+// Выполнение логики принятой текстовой команды
+void executeCommand(char cmd, uint8_t portSource) {
+    switch (cmd) {
+        case '?': // Запрос параметров: POS, BUF, STEP и DIR
+            sendResponseStr("POS:", portSource); sendResponseUInt(currentPosition, portSource);
+            sendResponseStr(" BUF:", portSource); sendResponseInt(accumulatedSteps, portSource);
+            sendResponseStr(" STEP:", portSource); sendResponseUInt((uint32_t)current_microstep, portSource);
+            sendResponseStr(" DIR:", portSource); sendResponseUInt((uint32_t)current_direction, portSource);
+            sendResponseStr("\r\n", portSource); 
+            break;
+            
+        case 'Z': // Принудительное базирование по физическому датчику положения
+            __critical {
+                homeOffset = data_ssi;      // Текущая физическая позиция становится логическим нулем
+                prevSsiPos = data_ssi;      // Синхронизируем дельту, предотвращая ложный скачок вала
+                accumulatedSteps = 0;       // Мгновенно очищаем накопленный буфер шагов мотора
+            }
+            sendResponseStr("OK:HOME_SET\r\n", portSource); 
+            break;
+            
+        case 'E': // Чтение статуса ошибок диагностики шлейфа
+            sendResponseStr("ERR:", portSource); sendResponseUInt((uint32_t)encoderStatus, portSource);
+            sendResponseStr("\r\n", portSource); 
+            break;
+
+        case 'M': // Настройка микрошага «на лету»: M16;, M32;, M64;, M128;
+            if (portSource == MODE_USB) {
+                if (usbBuffer[1] == '1' && usbBuffer[2] == '6') {
+                    __critical { current_microstep = 16; scale_K_mul = 25; accumulatedSteps = 0; }
+                    sendResponseStr("SET:16\r\n", portSource);
+                } 
+                else if (usbBuffer[1] == '3' && usbBuffer[2] == '2') {
+                    __critical { current_microstep = 32; scale_K_mul = 50; accumulatedSteps = 0; }
+                    sendResponseStr("SET:32\r\n", portSource);
+                } 
+                else if (usbBuffer[1] == '6' && usbBuffer[2] == '4') {
+                    __critical { current_microstep = 64; scale_K_mul = 100; accumulatedSteps = 0; }
+                    sendResponseStr("SET:64\r\n", portSource);
+                } 
+                else if (usbBuffer[1] == '1' && usbBuffer[2] == '2' && usbBuffer[3] == '8') {
+                    __critical { current_microstep = 128; scale_K_mul = 200; accumulatedSteps = 0; }
+                    sendResponseStr("SET:128\r\n", portSource);
+                } 
+                else { sendResponseStr("ERR:INVALID_STEP\r\n", portSource); }
+            } 
+            else { // Для физического порта UART0
+                if (uartBuffer[1] == '1' && uartBuffer[2] == '6') {
+                    __critical { current_microstep = 16; scale_K_mul = 25; accumulatedSteps = 0; }
+                    sendResponseStr("SET:16\r\n", portSource);
+                } 
+                else if (uartBuffer[1] == '3' && uartBuffer[2] == '2') {
+                    __critical { current_microstep = 32; scale_K_mul = 50; accumulatedSteps = 0; }
+                    sendResponseStr("SET:32\r\n", portSource);
+                } 
+                else if (uartBuffer[1] == '6' && uartBuffer[2] == '4') {
+                    __critical { current_microstep = 64; scale_K_mul = 100; accumulatedSteps = 0; }
+                    sendResponseStr("SET:64\r\n", portSource);
+                } 
+                else if (uartBuffer[1] == '1' && uartBuffer[2] == '2' && uartBuffer[3] == '8') {
+                    __critical { current_microstep = 128; scale_K_mul = 200; accumulatedSteps = 0; }
+                    sendResponseStr("SET:128\r\n", portSource);
+                } 
+                else { sendResponseStr("ERR:INVALID_STEP\r\n", portSource); }
+            }
+            break;
+
+        case 'D': // Настройка направления вращения: D0; (прямое), D1; (инверсия)
+            {
+                char val_char = (portSource == MODE_USB) ? usbBuffer[1] : uartBuffer[1];
+                if (val_char == '0') {
+                    __critical { current_direction = 0; accumulatedSteps = 0; }
+                    sendResponseStr("DIR:DIRECT\r\n", portSource);
+                } 
+                else if (val_char == '1') {
+                    __critical { current_direction = 1; accumulatedSteps = 0; }
+                    sendResponseStr("DIR:INVERTED\r\n", portSource);
+                } 
+                else {
+                    sendResponseStr("ERR:INVALID_DIR\r\n", portSource);
+                }
+            }
+            break;
+            
+        default:  // Ошибка синтаксиса команды
+            sendResponseStr("ERR:UNKNOWN\r\n", portSource); 
+            break;
+    }
+}
+
+void parseComms() {
+    uint32_t currentMillis = millis();
+    uint32_t currentMicros = micros();
+
+    // 1. Освобождение взаимной блокировки интерфейсов по таймауту 1 сек тишины
+    if (activePortMode != MODE_NONE && (currentMillis - lastPortActivityTime >= PORT_LOCK_TIMEOUT)) {
+        activePortMode = MODE_NONE;
+    }
+
+    // --- ОБРАБОТКА ИНТЕРФЕЙСА USB-CDC ---
+    if (activePortMode != MODE_UART && usb_is_configured) {
+        if (USBSerial_available() > 0) { 
+            activePortMode = MODE_USB;
+            lastPortActivityTime = currentMillis; 
+            lastCharTime = currentMicros;
+
+            while (USBSerial_available() > 0) {
+                char c = (char)USBSerial_read(); 
+                lastCharTime = micros();
+
+                if (c == ';') { // Защита: выполнение СТРОГО по ';'
+                    if (usbBufIdx > 0) { 
+                        executeCommand(usbBuffer[0], MODE_USB); // Передаем первый символ команды на декодирование
+                        usbBufIdx = 0; // Очистка буфера сразу после выполнения
+                    }
+                } else if (c != '\n' && c != '\r' && usbBufIdx < 7) {
+                    usbBuffer[usbBufIdx++] = c;
+                }
+            }
+        }
+        // Защита: Если символ ';' не прилетел за 2 мс тишины, принудительно очищаем буфер мусора
+        else if (usbBufIdx > 0 && (currentMicros - lastCharTime >= PACKET_TIMEOUT_US)) { 
+            usbBufIdx = 0; 
+        }
+    }
+
+    // --- ОБРАБОТКА ИНТЕРФЕЙСА UART0 (RS-232) ---
+    if (activePortMode != MODE_USB) {
+        if (Serial0_available() > 0) { 
+            activePortMode = MODE_UART;
+            lastPortActivityTime = currentMillis; 
+            lastCharTime = currentMicros;
+
+            while (Serial0_available() > 0) {
+                char c = (char)Serial0_read(); 
+                lastCharTime = micros();
+
+                if (c == ';') { // Защита: выполнение СТРОГО по ';'
+                    if (uartBufIdx > 0) { 
+                        executeCommand(uartBuffer[0], MODE_UART); 
+                        uartBufIdx = 0; // Очистка буфера сразу после выполнения
+                    }
+                } else if (c != '\n' && c != '\r' && uartBufIdx < 7) {
+                    uartBuffer[uartBufIdx++] = c;
+                }
+            }
+        }
+        // Защита: Если символ ';' не прилетел за 2 мс тишины, принудительно очищаем буфер мусора
+        else if (uartBufIdx > 0 && (currentMicros - lastCharTime >= PACKET_TIMEOUT_US)) { 
+            uartBufIdx = 0; 
+        }
+    }
+}
+
+void updateStatusLED() {
+    uint32_t currentMillis = millis();
+    static uint8_t ledState = 0; 
+
+    if (encoderStatus == ENCODER_OK && !isFirstRun) {
+        pwrLedOnDuration = 50;   // Исправный обмен (короткие вспышки 50 мс)
+        pwrLedOffDuration = 950; 
+    } else {
+        pwrLedOnDuration = 500;  // Авария/Простой (меандр 50/50)
+        pwrLedOffDuration = 500;
+    }
+
+    if (ledState == 1) {
+        if (currentMillis - lastPwrLedTime >= pwrLedOnDuration) {
+            ledState = 0; lastPwrLedTime = currentMillis; LED_PWR_OFF();
+        }
+    } else {
+        if (currentMillis - lastPwrLedTime >= pwrLedOffDuration) {
+            ledState = 1; lastPwrLedTime = currentMillis; LED_PWR_ON();
+        }
+    }
+}
+
+// Функция безопасного стартового ожидания хоста (оптимальный таймаут 2000 мс)
+void waitForUSBOrTimeout() {
+    uint32_t startTime = millis();
+    uint16_t bus_active_counter = 0;
+    
+    // Даем хосту до 2 секунд (2000 мс) на инициализацию при автономном пуске
+    while (millis() - startTime < 2000) {
+        
+        // Читаем регистр статуса шины USB_MIS_ST (адрес 0xD5). 
+        // 5-й бит (маска 0x20) равен 0, когда шина USB активна и ПК общается с чипом.
+        if ((*(volatile __data uint8_t*)0xD5 & 0x20) == 0) {
+            bus_active_counter++;
+            
+            // Если шина стабильно активна в течение нескольких циклов
+            if (bus_active_counter > 50) {
+                usb_is_configured = 1;
+                break; // ПК на связи! Мгновенно прерываем 2-секундное ожидание и выходим!
+            }
+        } else {
+            if (bus_active_counter > 0) bus_active_counter--;
+        }
+        
+        // Быстрое мерцание PWR_LED в процессе ожидания (каждые 50 мс)
+        if ((millis() / 50) % 2 == 0) { LED_PWR_ON(); } else { LED_PWR_OFF(); }
+    }
+    LED_PWR_OFF(); // Гасим светодиод перед запуском основного цикла
+}
+
+// =========================================================================
+// 7. ОСНОВНЫЕ СИСТЕМНЫЕ ФУНКЦИИ ARDUINO
+// =========================================================================
+void setup() {
+    initHardwarePorts();
+    
+    // Разрешаем прерывания сразу, чтобы оживить аппаратный USB-контроллер чипа
+    EA = 1; 
+    
+    // Мгновенно обнаруживает ПК (за ~200-400 мс) или выходит по таймауту 2 сек
+    waitForUSBOrTimeout(); 
+    
+    initTimer2AndUart0();  // Склеиваем UART0 и Таймер 2, сохраняя USB-CDC
+}
+
+void loop() {
+    uint32_t currentTime = micros();
+
+    // Жесткий реалтайм: Опрос энкодера ЛИР-ДАТ237Т по расписанию (5 кГц)
+    if (currentTime - lastSampleTime >= sampleInterval) {
+        lastSampleTime = currentTime;
+
+        data_ssi = readSSI23_diagnostic();
+
+        if (encoderStatus == ENCODER_OK) {
+            currentPosition = data_ssi; // Сохраняем для ответов парсера
+            processEncoderData(data_ssi);
+        } else {
+            __critical { accumulatedSteps = 0; }
+            PIN_A_DRV = 0; PIN_B_DRV = 0;
+            LED_ACT_ON(); 
+        }
+    }
+
+    // Выполнение фоновых низкоприоритетных задач
+    updateStatusLED(); 
+    parseComms();      
+}
